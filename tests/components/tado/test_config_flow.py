@@ -46,6 +46,11 @@ async def test_full_flow(
     )
     assert result["type"] is FlowResultType.SHOW_PROGRESS
     assert result["step_id"] == "user"
+    assert result["progress_action"] == "wait_for_device"
+    assert result["description_placeholders"]["url"] == (
+        "https://login.tado.com/oauth2/device?user_code=TEST"
+    )
+    assert result["description_placeholders"]["code"] == "TEST"
 
     event.set()
     await hass.async_block_till_done()
