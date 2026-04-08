@@ -10,7 +10,7 @@
       "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
     },
     "progress": {
-      "wait_for_device": "To authenticate, open the following URL and login at Tado:\n{url}\nIf the code is not automatically copied, paste the following code to authorize the integration:\n\n```{code}```\n\n\nThe login attempt will time out after five minutes."
+      "wait_for_device": "To authenticate, open the following link and login at Tado:\n\n[**Open Tado Login**]({url})\n\nIf the code is not automatically copied, paste the following code to authorize the integration:\n\n**{code}**\n\nThe login attempt will time out after five minutes."
     },
     "step": {
       "homekit": {

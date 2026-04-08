@@ -23,6 +23,7 @@ from .const import (
     INSIDE_TEMPERATURE_MEASUREMENT,
     PRESET_AUTO,
     TEMP_OFFSET,
+    TYPE_HEATING,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,16 +80,23 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         """Return fallback flag to Smart Schedule."""
         return self._fallback
 
+    @property
+    def is_tadox(self) -> bool:
+        """Return True if connected to a TadoX system (hops.tado.com API)."""
+        return bool(getattr(self._tado, "_http", None) and self._tado._http.is_x_line)
+
     async def _async_update_data(self) -> dict[str, dict]:
         """Fetch the (initial) latest data from Tado."""
         try:
             _LOGGER.debug("Preloading home data")
             tado_home_call = await self.hass.async_add_executor_job(self._tado.get_me)
             _LOGGER.debug("Preloading zones and devices")
-            self.zones = await self.hass.async_add_executor_job(self._tado.get_zones)
-            self.devices = await self.hass.async_add_executor_job(
+            raw_zones = await self.hass.async_add_executor_job(self._tado.get_zones)
+            self.zones = self._normalize_zones(raw_zones)
+            raw_devices = await self.hass.async_add_executor_job(
                 self._tado.get_devices
             )
+            self.devices = self._normalize_devices(raw_devices)
         except RequestException as err:
             _LOGGER.debug("Checking rate limit")
             ratelimit = self.get_rate_limit()
@@ -123,6 +131,62 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
 
         return self.data
 
+    @staticmethod
+    def _backfill_device_keys(device: dict[str, Any]) -> None:
+        """Backfill old API keys on a single device dict for downstream compatibility."""
+        serial = device.get("shortSerialNo") or device.get("serialNumber")
+        if serial:
+            device.setdefault("shortSerialNo", serial)
+            device.setdefault("serialNo", serial)
+        if "deviceType" not in device and "type" in device:
+            device["deviceType"] = device["type"]
+        if "currentFwVersion" not in device and "firmwareVersion" in device:
+            device["currentFwVersion"] = device["firmwareVersion"]
+        # TadoX returns TEMP_OFFSET as a plain float; wrap for downstream code
+        if TEMP_OFFSET in device and isinstance(device[TEMP_OFFSET], (int, float)):
+            val = device[TEMP_OFFSET]
+            device[TEMP_OFFSET] = {"celsius": val, "fahrenheit": val * 1.8}
+
+    @staticmethod
+    def _normalize_devices(raw_devices: list) -> list[dict[str, Any]]:
+        """Flatten and normalize the raw device list from the Tado API."""
+        flat: list[dict[str, Any]] = []
+        for entry in raw_devices:
+            if isinstance(entry, list):
+                flat.extend(d for d in entry if isinstance(d, dict))
+            elif isinstance(entry, dict):
+                flat.append(entry)
+        for device in flat:
+            TadoDataUpdateCoordinator._backfill_device_keys(device)
+        return flat
+
+    @staticmethod
+    def _normalize_zones(raw_zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize zone data from both old and new Tado API formats.
+
+        The new TadoX API returns rooms with different field names.
+        This backfills old API keys so downstream code works unchanged.
+        """
+        normalized = []
+        for zone in raw_zones:
+            # TadoX uses roomId/roomName instead of id/name
+            if "id" not in zone and "roomId" in zone:
+                zone["id"] = zone["roomId"]
+            if "name" not in zone and "roomName" in zone:
+                zone["name"] = zone["roomName"]
+            # Old API has 'type', new API (TadoX) does not
+            if "type" not in zone:
+                zone["type"] = TYPE_HEATING
+            # Ensure 'devices' key exists
+            if "devices" not in zone:
+                zone["devices"] = []
+            # Backfill old API keys on each device in the zone
+            for device in zone["devices"]:
+                if isinstance(device, dict):
+                    TadoDataUpdateCoordinator._backfill_device_keys(device)
+            normalized.append(zone)
+        return normalized
+
     async def _async_update_devices(self) -> dict[str, dict]:
         """Update the device data from Tado."""
 
@@ -141,21 +205,27 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     def _update_device_info(self, devices: list[dict[str, Any]]) -> dict[str, dict]:
         """Update the device data from Tado."""
         mapped_devices: dict[str, dict] = {}
-        for device in devices:
-            device_short_serial_no = device["shortSerialNo"]
+        flat_devices = self._normalize_devices(devices)
+        for device in flat_devices:
+            device_short_serial_no = device.get("shortSerialNo")
+            if not device_short_serial_no:
+                continue
             _LOGGER.debug("Updating device %s", device_short_serial_no)
             try:
-                if (
-                    INSIDE_TEMPERATURE_MEASUREMENT
-                    in device["characteristics"]["capabilities"]
-                ):
+                characteristics = device.get("characteristics", {})
+                capabilities = characteristics.get("capabilities", [])
+                if INSIDE_TEMPERATURE_MEASUREMENT in capabilities:
                     _LOGGER.debug(
                         "Updating temperature offset for device %s",
                         device_short_serial_no,
                     )
-                    device[TEMP_OFFSET] = self._tado.get_device_info(
+                    offset = self._tado.get_device_info(
                         device_short_serial_no, TEMP_OFFSET
                     )
+                    # TadoX returns a plain float; wrap it for downstream code
+                    if isinstance(offset, (int, float)):
+                        offset = {"celsius": offset, "fahrenheit": offset * 1.8}
+                    device[TEMP_OFFSET] = offset
             except RequestException as err:
                 _LOGGER.error(
                     "Error updating device %s: %s", device_short_serial_no, err
@@ -175,7 +245,17 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             zone_states_call = await self.hass.async_add_executor_job(
                 self._tado.get_zone_states
             )
-            zone_states = zone_states_call["zoneStates"]
+            if isinstance(zone_states_call, dict):
+                zone_states = zone_states_call["zoneStates"]
+            elif isinstance(zone_states_call, list):
+                # TadoX API returns a list of zone state dicts with 'id' key
+                zone_states = {
+                    str(state["id"]): state
+                    for state in zone_states_call
+                    if isinstance(state, dict) and "id" in state
+                }
+            else:
+                raise UpdateFailed(f"Unexpected zone_states type: {type(zone_states_call)}")
         except RequestException as err:
             _LOGGER.error("Error updating Tado zones: %s", err)
             raise UpdateFailed(f"Error updating Tado zones: {err}") from err
@@ -222,6 +302,14 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     async def get_capabilities(self, zone_id: int | str) -> dict:
         """Fetch the capabilities from Tado."""
 
+        if self.is_tadox:
+            # TadoX API does not support get_capabilities; return defaults
+            return {
+                "type": TYPE_HEATING,
+                "temperatures": {
+                    "celsius": {"min": 5.0, "max": 25.0, "step": 0.1},
+                },
+            }
         try:
             return await self.hass.async_add_executor_job(
                 self._tado.get_capabilities, zone_id
